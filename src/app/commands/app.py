@@ -190,6 +190,51 @@ def get_user_input() -> Dict[str, Any]:
         
         # Normalize path
         mods_path = os.path.abspath(mods_path)
+
+        # Check for incomplete translation in temp folder
+        temp_path = "temp"
+        resume_mode = False
+        target_lang_from_temp = None
+        incomplete_translation_info = None
+
+        if os.path.exists(temp_path) and os.listdir(temp_path):
+            # Try to detect the target language from existing files
+            console.print("\n[bold yellow]Found incomplete translation in temp folder[/bold yellow]")
+            
+            # Count files to give user feedback
+            json_files = 0
+            lang_files = 0
+            for root, _, files in os.walk(temp_path):
+                for file in files:
+                    if file.lower().endswith('.json'):
+                        json_files += 1
+                    elif file.lower().endswith('.lang'):
+                        lang_files += 1
+            
+            console.print(f"  • Found {json_files} JSON translation file(s)")
+            console.print(f"  • Found {lang_files} LANG translation file(s)")
+
+            resume_choice = questionary.select(
+                "Do you want to resume the previous translation or start a new one?",
+                choices=[
+                    {"name": "Resume previous translation", "value": "resume"},
+                    {"name": "Start fresh translation", "value": "new"}
+                ],
+                instruction="(Use ↑↓ and Enter)",
+                style=QUESTIONARY_STYLE,
+                use_jk_keys=False
+            ).ask()
+
+            if resume_choice is None:  # This occurs when user presses Ctrl+C
+                sys.exit(0)
+
+            resume_mode = resume_choice == "resume"
+
+            if resume_mode:
+                console.print("[bold]Resuming previous translation from temp folder...[/bold]")
+                console.print("  • Skipping mod extraction")
+                console.print("  • Continuing translation from where it left off")
+
           # Get source language - using English (en_US) as default
         # Find the en_US option to use as default
         default_source = next((option for option in language_options if option["value"] == "en_US"), language_options[0])
@@ -333,6 +378,9 @@ def get_user_input() -> Dict[str, Any]:
         confirmation_table.add_row("Translation method", "🤖 OpenAI (Premium)" if use_ai else "🌐 Google Translate (Free)")
         confirmation_table.add_row("Output path", output_path)
         
+        if resume_mode:
+            confirmation_table.add_row("Mode", "Resume translation (from temp)")
+
         console.print(confirmation_table)
         console.print()
         
@@ -353,7 +401,8 @@ def get_user_input() -> Dict[str, Any]:
             "source": source_lang,
             "target": target_lang,
             "output": output_path,
-            "ai": use_ai
+            "ai": use_ai,
+            "resume": resume_mode
         }
     except KeyboardInterrupt:
         # Silently exit on Ctrl+C without showing any error message

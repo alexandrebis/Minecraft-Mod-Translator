@@ -5,13 +5,24 @@ echo "  Minecraft Mod Translator Compiler"
 echo "===================================="
 echo
 
+# Clear problematic environment variables that might point to Python 2.7
+unset PYTHONPATH
+unset PYTHONHOME
+unset PYTHONSTARTUP
+
+# Set Python3 path (using POSIX path for Git Bash)
+PYTHON_EXE="C:/Python/python.exe"
+echo "Using Python: $PYTHON_EXE"
+"$PYTHON_EXE" --version
+echo
+
 # Change to project root directory
 cd "$(dirname "$0")/.."
 
 # Check if virtual environment exists
 if [ ! -d "venv" ]; then
     echo "Creating virtual environment..."
-    python3 -m venv venv
+    "$PYTHON_EXE" -m venv venv
     if [ $? -ne 0 ]; then
         echo "Error: Failed to create virtual environment"
         exit 1
@@ -19,9 +30,21 @@ if [ ! -d "venv" ]; then
     echo "Virtual environment created successfully."
 fi
 
-# Activate virtual environment
+# Activate virtual environment (support Windows venv layout when running under Git Bash)
 echo "Activating virtual environment..."
-source venv/bin/activate
+if [ -f "venv/bin/activate" ]; then
+    # POSIX-style venv (Linux/macOS)
+    source venv/bin/activate
+elif [ -f "venv/Scripts/activate" ]; then
+    # Windows venv but running under Git Bash/MSYS2: there is a bash-style activate in Scripts
+    source venv/Scripts/activate
+elif [ -f "venv/Scripts/Activate.ps1" ]; then
+    echo "Detected PowerShell activation script. Please run the Windows setup/compile scripts in PowerShell or cmd.exe."
+    exit 1
+else
+    echo "Error: No activation script found in venv."
+    exit 1
+fi
 if [ $? -ne 0 ]; then
     echo "Error: Failed to activate virtual environment"
     exit 1
@@ -30,7 +53,8 @@ echo "Virtual environment activated successfully."
 
 # Install dependencies
 echo "Installing dependencies..."
-pip install -r requirements.txt
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
 if [ $? -ne 0 ]; then
     echo "Error: Failed to install dependencies"
     exit 1
@@ -39,10 +63,10 @@ echo "Dependencies installed successfully."
 
 # Check if PyInstaller is installed
 echo "Checking PyInstaller..."
-pip show pyinstaller > /dev/null 2>&1
+python -m pip show pyinstaller > /dev/null 2>&1
 if [ $? -ne 0 ]; then
     echo "Installing PyInstaller..."
-    pip install pyinstaller
+    python -m pip install pyinstaller
     if [ $? -ne 0 ]; then
         echo "Error: Failed to install PyInstaller"
         exit 1
@@ -80,7 +104,7 @@ EOF
 
 # Get pyfiglet fonts location
 echo "Finding pyfiglet fonts location..."
-PYFIGLET_PATH=$(python3 -c "import pyfiglet; import os; print(os.path.dirname(pyfiglet.__file__))")
+PYFIGLET_PATH=$(python -c "import pyfiglet; import os; print(os.path.dirname(pyfiglet.__file__))")
 echo "Pyfiglet path: $PYFIGLET_PATH"
 
 # Compile the CLI application

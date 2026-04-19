@@ -8,7 +8,7 @@ import re
 import shutil
 import argparse
 from zipfile import ZipFile, ZIP_DEFLATED
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Optional
 
 # Import retry logic utilities
 from ..utils.retry_logic import (
@@ -337,6 +337,7 @@ class Settings:
         self.temp_path = "temp"
         self.translation_path = "./translated"
         self.use_ai = False  # Default to Google Translate
+        self.resume = False  # Default to not resuming
 
         # Override with CLI arguments if provided
         if cli_args:
@@ -364,6 +365,9 @@ class Settings:
 
             if hasattr(cli_args, "output") and cli_args.output:
                 self.translation_path = cli_args.output
+
+            if hasattr(cli_args, "resume") and cli_args.resume:
+                self.resume = True
 
         # Set Google language codes
         self.source_google_lang = self._get_google_lang(self.source_mc_lang)
@@ -435,6 +439,61 @@ class FileManager:
         """
         os.makedirs(self.temp_path, exist_ok=True)
         os.makedirs(self.translation_path, exist_ok=True)
+
+    def check_incomplete_translation(self) -> Optional[Dict[str, Any]]:
+        """
+        Check if there's an incomplete translation in the temp folder.
+        Returns a dictionary with information about the incomplete translation,
+        or None if no incomplete translation is found.
+        """
+        if not os.path.exists(self.temp_path) or not os.listdir(self.temp_path):
+            return None
+
+        # Look for target language files in the temp folder
+        target_json_lower = f"{self.target_mc_lang.lower()}{JSON}"
+        target_json_original = f"{self.target_mc_lang}{JSON}"
+        target_lang_lower = f"{self.target_mc_lang.lower()}{LANG}"
+        target_lang_original = f"{self.target_mc_lang}{LANG}"
+
+        target_files = []
+        source_files = []
+        
+        source_json_lower = f"{self.source_mc_lang.lower()}{JSON}"
+        source_json_original = f"{self.source_mc_lang}{JSON}"
+        source_lang_lower = f"{self.source_mc_lang.lower()}{LANG}"
+        source_lang_original = f"{self.source_mc_lang}{LANG}"
+
+        for foldername, _, filenames in os.walk(self.temp_path):
+            for filename in filenames:
+                lower_filename = filename.lower()
+                # Check for target language files
+                if (
+                    lower_filename == target_json_lower.lower()
+                    or lower_filename == target_json_original.lower()
+                    or lower_filename == target_lang_lower.lower()
+                    or lower_filename == target_lang_original.lower()
+                ):
+                    target_files.append(os.path.join(foldername, filename))
+                
+                # Check for source language files
+                if (
+                    lower_filename == source_json_lower.lower()
+                    or lower_filename == source_json_original.lower()
+                    or lower_filename == source_lang_lower.lower()
+                    or lower_filename == source_lang_original.lower()
+                ):
+                    source_files.append(os.path.join(foldername, filename))
+
+        if target_files:
+            return {
+                'has_incomplete': True,
+                'target_files': target_files,
+                'source_files': source_files,
+                'target_language': self.target_mc_lang,
+                'temp_size': sum(os.path.getsize(f) for f in target_files if os.path.isfile(f))
+            }
+
+        return None
 
     def unpack_mods(self) -> None:
         """
@@ -1183,6 +1242,9 @@ def add_translate_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--ai", action="store_true", help="Use OpenAI translation instead of Google Translate"
     )
+    parser.add_argument(
+        "--resume", action="store_true", help="Resume a previously started translation"
+    )
 
 
 def handle_translate_command(args: argparse.Namespace) -> None:
@@ -1239,8 +1301,46 @@ def handle_translate_command(args: argparse.Namespace) -> None:
         
         file_manager.create_needed_folders()
         
-        log_title('Unpacking mod files...')
-        file_manager.unpack_mods()
+        # Check if we should resume a previous translation
+        resume_translation = settings.resume
+
+        # If not explicitly set via CLI, check if an incomplete translation exists
+        incomplete_info = None
+        if not resume_translation:
+            incomplete_info = file_manager.check_incomplete_translation()
+            if incomplete_info:
+                log_message(f"Found incomplete translation for {settings.target_mc_lang}")
+                log_message(f"  • {len(incomplete_info['target_files'])} translated file(s) detected")
+                log_message(f"  • {len(incomplete_info['source_files'])} source file(s) available for completion")
+                log_message(f"  • Data size: {incomplete_info['temp_size'] / (1024*1024):.2f} MB")
+                log_message("")
+                log_message("Would you like to resume this translation? (y/n)")
+                response = input().strip().lower()
+                resume_translation = response in ['y', 'yes']
+
+        # Handle unpacking based on resume status
+        if resume_translation:
+            incomplete_info = incomplete_info or file_manager.check_incomplete_translation()
+            if incomplete_info:
+                log_title('Resuming previous translation...')
+                log_message(f"Using existing unpacked mods in {file_manager.temp_path}")
+                log_message(f"Continuing translation to {settings.target_mc_lang}...")
+                # Skip unpacking, files should already be extracted
+            else:
+                log_message(f"⚠️ No incomplete translation found for {settings.target_mc_lang}")
+                log_message("Starting fresh translation...")
+                log_title('Unpacking mod files...')
+                file_manager.unpack_mods()
+        else:
+            # Check if temp folder exists and needs to be cleaned
+            if os.path.exists(file_manager.temp_path) and os.listdir(file_manager.temp_path):
+                log_message(f"Cleaning existing temp folder at {file_manager.temp_path}")
+                file_manager.remove_folder(file_manager.temp_path)
+                file_manager.create_needed_folders()
+
+            log_title('Unpacking mod files...')
+            file_manager.unpack_mods()
+
         lang_folders = file_manager.get_lang_folders()
         log_title('Translating mods...')
         file_manager.edit_lang_files(lang_folders)
