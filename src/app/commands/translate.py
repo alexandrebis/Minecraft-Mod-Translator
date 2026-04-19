@@ -9,6 +9,10 @@ import shutil
 import argparse
 from zipfile import ZipFile, ZIP_DEFLATED
 from typing import Dict, List, Any, Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Lock, Semaphore
+import queue
+from rich.progress import Progress, BarColumn, TextColumn, DownloadColumn, TransferSpeedColumn
 
 # Import retry logic utilities
 from ..utils.retry_logic import (
@@ -23,6 +27,52 @@ JSON = ".json"
 LANG = ".lang"
 MCFUNCTION = ".mcfunction"
 DISABLE_LOGS = False
+
+# Global progress tracking
+progress_lock = Lock()
+global_progress = None
+
+
+class ThreadSafeProgress:
+    """Thread-safe progress tracker for multithreaded operations."""
+    
+    def __init__(self):
+        self.lock = Lock()
+        self.progress = None
+        self.tasks = {}
+    
+    def start(self, description="Processing"):
+        """Start progress tracking."""
+        self.progress = Progress(
+            TextColumn("[bold blue]{task.description}"),
+            BarColumn(),
+            TextColumn("[progress.percentage]{task.percentage:>3.1f}%"),
+            TextColumn("•"),
+            DownloadColumn(),
+            TextColumn("•"),
+            TransferSpeedColumn(),
+        )
+        self.progress.start()
+        return self
+    
+    def add_task(self, description: str, total: int):
+        """Add a task to track."""
+        with self.lock:
+            task_id = self.progress.add_task(description, total=total)
+            self.tasks[description] = task_id
+            return task_id
+    
+    def update(self, task_id: int, advance: float = 1):
+        """Update a task's progress (thread-safe)."""
+        with self.lock:
+            if self.progress and task_id is not None:
+                self.progress.update(task_id, advance=advance)
+    
+    def stop(self):
+        """Stop progress tracking."""
+        if self.progress:
+            self.progress.stop()
+            self.progress = None
 
 # Logging functions
 title = ""
@@ -220,62 +270,113 @@ class Translator:
             return self._translate_data_google(data)
 
     def _translate_data_openai(self, data: Dict[str, str]) -> Dict[str, str]:
-        """Translate data using OpenAI with rate limiting protection"""
+        """Translate data using OpenAI with rate limiting protection, threading, and progress tracking"""
         import time
         
         translated_data = {}
         total_items = len(data)
         
-        for index, (key, text) in enumerate(data.items(), 1):
-            if not text or not isinstance(text, str):
-                translated_data[key] = text
-                continue
-
-            try:
-                translated_text = self._translate_with_openai(text)
-                log_message(f'🤖 [{index}/{total_items}] "{text}" → "{translated_text}"')
-                translated_data[key] = translated_text
+        # Use threading for OpenAI but with lower concurrency to respect API limits
+        # OpenAI has stricter rate limits than Google
+        max_workers = min(2, max(1, total_items // 20))  # Very conservative threading
+        
+        # Create progress tracker
+        progress = ThreadSafeProgress()
+        progress.start("OpenAI Translation")
+        task_id = progress.add_task("Translation", total=total_items)
+        
+        try:
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_to_key = {}
                 
-                # Add a small delay between requests to avoid overwhelming the API
-                # Skip delay for the last item
-                if index < total_items:
-                    time.sleep(0.1)  # 100ms delay between requests
+                for index, (key, text) in enumerate(data.items(), 1):
+                    if not text or not isinstance(text, str):
+                        translated_data[key] = text
+                        progress.update(task_id, advance=1)
+                        continue
                     
-            except Exception as e:
-                log_message(f'Error translating "{text}": {str(e)}')
-                translated_data[key] = text
-
+                    # Submit translation task to thread pool
+                    future = executor.submit(self._translate_with_openai, text)
+                    future_to_key[future] = (key, text, index)
+                
+                # Process completed translations as they finish
+                completed = 0
+                for future in as_completed(future_to_key):
+                    key, original_text, index = future_to_key[future]
+                    try:
+                        translated_text = future.result()
+                        translated_data[key] = translated_text
+                        log_message(f'🤖 [{index}/{total_items}] "{original_text}" → "{translated_text}"')
+                    except Exception as e:
+                        log_message(f'Error translating "{original_text}": {str(e)}')
+                        translated_data[key] = original_text
+                    finally:
+                        progress.update(task_id, advance=1)
+                    
+                    completed += 1
+                    # Add delay between completions to respect API rate limits
+                    if completed < total_items:
+                        time.sleep(0.3)
+        finally:
+            progress.stop()
+        
         log_message(f"Successfully translated {len(data)} entries using OpenAI")
         return translated_data
 
     def _translate_data_google(self, data: Dict[str, str]) -> Dict[str, str]:
-        """Translate data using Google Translate with rate limiting protection"""
+        """Translate data using Google Translate with rate limiting protection, threading, and progress tracking"""
         import time
         
         translated_data = {}
         total_items = len(data)
         
-        for index, (key, text) in enumerate(data.items(), 1):
-            if not text or not isinstance(text, str):
-                # Skip empty or non-string values
-                translated_data[key] = text
-                continue
-
-            try:
-                translated_text = self._translate_with_google(text)
-                log_message(f'🌐 [{index}/{total_items}] "{text}" → "{translated_text}"')
-                translated_data[key] = translated_text
+        # Use threading for faster translation
+        # Limit concurrent threads to avoid overwhelming the API
+        max_workers = min(4, max(1, total_items // 10))  # Adaptive threading
+        
+        # Create progress tracker
+        progress = ThreadSafeProgress()
+        progress.start("Google Translate")
+        task_id = progress.add_task("Translation", total=total_items)
+        
+        try:
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                # Create list of futures
+                future_to_key = {}
                 
-                # Add a small delay between requests to avoid overwhelming the API
-                # Skip delay for the last item
-                if index < total_items:
-                    time.sleep(0.1)  # 100ms delay between requests
+                for index, (key, text) in enumerate(data.items(), 1):
+                    if not text or not isinstance(text, str):
+                        # Handle empty/non-string values immediately
+                        translated_data[key] = text
+                        progress.update(task_id, advance=1)
+                        continue
                     
-            except Exception as e:
-                log_message(f'Error translating "{text}": {str(e)}')
-                translated_data[key] = text  # Keep original on error
-
-        log_message(f"Successfully translated {len(data)} entries using Google Translate")
+                    # Submit translation task to thread pool
+                    future = executor.submit(self._translate_with_google, text)
+                    future_to_key[future] = (key, text, index)
+                
+                # Process completed translations as they finish
+                completed = 0
+                for future in as_completed(future_to_key):
+                    key, original_text, index = future_to_key[future]
+                    try:
+                        translated_text = future.result()
+                        translated_data[key] = translated_text
+                        log_message(f'🌐 [{index}/{total_items}] "{original_text}" → "{translated_text}"')
+                    except Exception as e:
+                        log_message(f'Error translating "{original_text}": {str(e)}')
+                        translated_data[key] = original_text  # Keep original on error
+                    finally:
+                        progress.update(task_id, advance=1)
+                    
+                    completed += 1
+                    # Add small delay between batches to avoid rate limiting
+                    if completed % 5 == 0 and completed < total_items:
+                        time.sleep(0.2)
+        finally:
+            progress.stop()
+        
+        log_message(f"Successfully translated {len(translated_data)} entries using Google Translate")
         return translated_data
 
     def translate(self, string: str) -> str:
@@ -497,16 +598,57 @@ class FileManager:
 
     def unpack_mods(self) -> None:
         """
-        Unpack all mod.jar files.
+        Unpack all mod.jar files using threading for faster extraction.
         """
         mod_list = os.listdir(self.mods_path)
-        for mod_name in mod_list:
-            if mod_name.endswith(JAR):
-                mod_file_path = os.path.join(self.mods_path, mod_name)
-                unpacking_destination = os.path.join(self.temp_path, mod_name)
-                with ZipFile(mod_file_path, "r") as zip:
-                    log_message(f"Unpacking {mod_name}...")
-                    zip.extractall(unpacking_destination)
+        jar_files = [m for m in mod_list if m.endswith(JAR)]
+        
+        if not jar_files:
+            log_message("No JAR files found to extract")
+            return
+        
+        # Use threading for faster extraction with progress tracking
+        max_workers = min(4, max(1, len(jar_files) // 2))
+        
+        # Create progress tracker
+        progress = ThreadSafeProgress()
+        progress.start("Extracting mods")
+        task_id = progress.add_task("Extraction", total=len(jar_files))
+        
+        try:
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = {}
+                
+                for mod_name in jar_files:
+                    future = executor.submit(self._unpack_single_mod, mod_name)
+                    futures[future] = mod_name
+                
+                # Process results as they complete
+                for future in as_completed(futures):
+                    try:
+                        future.result()
+                    except Exception as e:
+                        mod_name = futures[future]
+                        log_message(f"Error extracting {mod_name}: {str(e)}")
+                    finally:
+                        progress.update(task_id, advance=1)
+        finally:
+            progress.stop()
+
+    def _unpack_single_mod(self, mod_name: str) -> None:
+        """
+        Unpack a single mod JAR file (used for threading).
+        """
+        mod_file_path = os.path.join(self.mods_path, mod_name)
+        unpacking_destination = os.path.join(self.temp_path, mod_name)
+        try:
+            with ZipFile(mod_file_path, "r") as zip:
+                log_message(f"Unpacking {mod_name}...")
+                zip.extractall(unpacking_destination)
+                log_message(f"Successfully extracted {mod_name}")
+        except Exception as e:
+            log_message(f"Error unpacking {mod_name}: {str(e)}")
+            raise
 
     def get_lang_folders(self) -> List[str]:
         """
@@ -607,134 +749,244 @@ class FileManager:
 
     def edit_lang_files(self, lang_folders: List[str]) -> None:
         """
-        Translate the source language file to the target language.
+        Translate the source language files to the target language using threading.
         """
-        for lang_folder in lang_folders:
-            # Extract mod name from the path in a platform-independent way
-            path_parts = lang_folder.split(os.sep)
-            # The mod name is typically the 2nd element in the path (after temp directory)
-            if len(path_parts) > 1:
-                mod_name = path_parts[1]
-                mod_name = mod_name.replace(JAR, "")
-            else:
-                mod_name = "unknown-mod"
+        if not lang_folders:
+            log_message("No language folders to process")
+            return
+        
+        # Use threading to process multiple language folders in parallel
+        max_workers = min(4, max(1, len(lang_folders) // 3))
+        
+        # Create progress tracker
+        progress = ThreadSafeProgress()
+        progress.start("Processing language folders")
+        task_id = progress.add_task("Translation", total=len(lang_folders))
+        
+        try:
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = {}
+                
+                for lang_folder in lang_folders:
+                    # Submit each folder processing to thread pool
+                    future = executor.submit(self._process_lang_folder, lang_folder)
+                    futures[future] = lang_folder
+                
+                # Process results as they complete
+                for future in as_completed(futures):
+                    try:
+                        future.result()
+                    except Exception as e:
+                        lang_folder = futures[future]
+                        log_message(f"Error processing {lang_folder}: {str(e)}")
+                    finally:
+                        progress.update(task_id, advance=1)
+        finally:
+            progress.stop()
 
-            log_subtitle(f"Processing {mod_name}...")
+    def _process_lang_folder(self, lang_folder: str) -> None:
+        """
+        Process a single language folder (used for threading).
+        """
+        # Extract mod name from the path in a platform-independent way
+        path_parts = lang_folder.split(os.sep)
+        # The mod name is typically the 2nd element in the path (after temp directory)
+        if len(path_parts) > 1:
+            mod_name = path_parts[1]
+            mod_name = mod_name.replace(JAR, "")
+        else:
+            mod_name = "unknown-mod"
 
-            # Check if source language files exist before attempting translation
-            source_json_path = os.path.join(
-                lang_folder, f"{self.source_mc_lang.lower()}{JSON}"
+        log_subtitle(f"Processing {mod_name}...")
+
+        # Check if source language files exist before attempting translation
+        source_json_path = os.path.join(
+            lang_folder, f"{self.source_mc_lang.lower()}{JSON}"
+        )
+        source_lang_path = os.path.join(lang_folder, f"{self.source_mc_lang}{LANG}")
+
+        # Target language file paths
+        target_json_path = os.path.join(
+            lang_folder, f"{self.target_mc_lang.lower()}{JSON}"
+        )
+        target_lang_path = os.path.join(lang_folder, f"{self.target_mc_lang}{LANG}")
+
+        # Flag to track if we found and processed any files
+        files_processed = False
+
+        # Check and process JSON files
+        if os.path.exists(source_json_path):
+            log_subtitle(
+                f"Creating {self.target_mc_lang.lower()}{JSON} from {self.source_mc_lang.lower()}{JSON}..."
             )
-            source_lang_path = os.path.join(lang_folder, f"{self.source_mc_lang}{LANG}")
-
-            # Target language file paths
-            target_json_path = os.path.join(
-                lang_folder, f"{self.target_mc_lang.lower()}{JSON}"
-            )
-            target_lang_path = os.path.join(lang_folder, f"{self.target_mc_lang}{LANG}")
-
-            # Flag to track if we found and processed any files
-            files_processed = False
-
-            # Check and process JSON files
-            if os.path.exists(source_json_path):
-                log_subtitle(
-                    f"Creating {self.target_mc_lang.lower()}{JSON} from {self.source_mc_lang.lower()}{JSON}..."
-                )
-                original_data = self._read_json_file(source_json_path)
-                if original_data:
-                    translated_data = self.translator.translate_data(original_data)
-                    self._write_json_file(translated_data, target_json_path)
-                    log_message(f"Successfully translated JSON file for {mod_name}")
-                    files_processed = True
-                else:
-                    log_message(f"No data found in source JSON file for {mod_name}")
-
-            # Check and process LANG files
-            if os.path.exists(source_lang_path):
-                log_subtitle(
-                    f"Creating {self.target_mc_lang}{LANG} from {self.source_mc_lang}{LANG}..."
-                )
-                original_data = self._read_lang_file(source_lang_path)
-                if original_data:
-                    translated_data = self.translator.translate_data(original_data)
-                    self._write_lang_file(translated_data, target_lang_path)
-                    log_message(f"Successfully translated LANG file for {mod_name}")
-                    files_processed = True
-                else:
-                    log_message(f"No data found in source LANG file for {mod_name}")
-
-            # If no exact match found, try case-insensitive search
-            if not files_processed:
-                log_message(
-                    f"Searching for alternative source files in {lang_folder}..."
-                )
-                for filename in os.listdir(lang_folder):
-                    lower_filename = filename.lower()
-
-                    # Try to find JSON files with case-insensitive matching
-                    if lower_filename == f"{self.source_mc_lang.lower()}{JSON}".lower():
-                        source_file_path = os.path.join(lang_folder, filename)
-                        target_file_path = os.path.join(
-                            lang_folder, f"{self.target_mc_lang.lower()}{JSON}"
-                        )
-
-                        log_subtitle(
-                            f"Creating {self.target_mc_lang.lower()}{JSON} from {filename}..."
-                        )
-                        original_data = self._read_json_file(source_file_path)
-                        if original_data:
-                            translated_data = self.translator.translate_data(
-                                original_data
-                            )
-                            self._write_json_file(translated_data, target_file_path)
-                            log_message(
-                                f"Successfully translated JSON file for {mod_name}"
-                            )
-                            files_processed = True
+            original_data = self._read_json_file(source_json_path)
+            if original_data:
+                # Check if target file already exists (resume optimization)
+                translated_data = {}
+                if os.path.exists(target_json_path):
+                    existing_data = self._read_json_file(target_json_path)
+                    if existing_data:
+                        translated_data = existing_data.copy()
+                        # Only translate keys that don't exist or are empty
+                        keys_to_translate = {k: v for k, v in original_data.items() 
+                                           if k not in translated_data or not translated_data[k]}
+                        if keys_to_translate:
+                            log_message(f"Resuming: {len(keys_to_translate)} new/modified entries to translate")
+                            new_translations = self.translator.translate_data(keys_to_translate)
+                            translated_data.update(new_translations)
                         else:
-                            log_message(
-                                f"No data found in source JSON file for {mod_name}"
-                            )
-
-                    # Try to find LANG files with case-insensitive matching
-                    elif lower_filename == f"{self.source_mc_lang}{LANG}".lower():
-                        source_file_path = os.path.join(lang_folder, filename)
-                        target_file_path = os.path.join(
-                            lang_folder, f"{self.target_mc_lang}{LANG}"
-                        )
-
-                        log_subtitle(
-                            f"Creating {self.target_mc_lang}{LANG} from {filename}..."
-                        )
-                        original_data = self._read_lang_file(source_file_path)
-                        if original_data:
-                            translated_data = self.translator.translate_data(
-                                original_data
-                            )
-                            self._write_lang_file(translated_data, target_file_path)
-                            log_message(
-                                f"Successfully translated LANG file for {mod_name}"
-                            )
-                            files_processed = True
-                        else:
-                            log_message(
-                                f"No data found in source LANG file for {mod_name}"
-                            )
-
-            if not files_processed:
-                log_message(f"No translatable language files found for {mod_name}")
-
-            # Check if this is a mod root folder and process .mcfunction files
-            # A mod root folder is directly under temp_path
-            temp_path_parts = self.temp_path.split(os.sep)
-            lang_folder_parts = lang_folder.split(os.sep)
-            
-            # Check if this folder is a mod root (temp_path + one level)
-            if len(lang_folder_parts) == len(temp_path_parts) + 1:
-                log_subtitle(f"Checking for .mcfunction files in {mod_name}...")
-                self.translate_mcfunction_files(lang_folder)
+                            log_message(f"Skipping: All entries already translated for {mod_name}")
+                    else:
+                        # Target exists but is empty, translate all
+                        translated_data = self.translator.translate_data(original_data)
+                else:
+                    # Target doesn't exist, translate all
+                    translated_data = self.translator.translate_data(original_data)
+                
+                self._write_json_file(translated_data, target_json_path)
+                log_message(f"Successfully translated JSON file for {mod_name}")
                 files_processed = True
+            else:
+                log_message(f"No data found in source JSON file for {mod_name}")
+
+        # Check and process LANG files
+        if os.path.exists(source_lang_path):
+            log_subtitle(
+                f"Creating {self.target_mc_lang}{LANG} from {self.source_mc_lang}{LANG}..."
+            )
+            original_data = self._read_lang_file(source_lang_path)
+            if original_data:
+                # Check if target file already exists (resume optimization)
+                translated_data = {}
+                if os.path.exists(target_lang_path):
+                    existing_data = self._read_lang_file(target_lang_path)
+                    if existing_data:
+                        translated_data = existing_data.copy()
+                        # Only translate keys that don't exist or are empty
+                        keys_to_translate = {k: v for k, v in original_data.items() 
+                                           if k not in translated_data or not translated_data[k]}
+                        if keys_to_translate:
+                            log_message(f"Resuming: {len(keys_to_translate)} new/modified entries to translate")
+                            new_translations = self.translator.translate_data(keys_to_translate)
+                            translated_data.update(new_translations)
+                        else:
+                            log_message(f"Skipping: All entries already translated for {mod_name}")
+                    else:
+                        # Target exists but is empty, translate all
+                        translated_data = self.translator.translate_data(original_data)
+                else:
+                    # Target doesn't exist, translate all
+                    translated_data = self.translator.translate_data(original_data)
+                
+                self._write_lang_file(translated_data, target_lang_path)
+                log_message(f"Successfully translated LANG file for {mod_name}")
+                files_processed = True
+            else:
+                log_message(f"No data found in source LANG file for {mod_name}")
+
+        # If no exact match found, try case-insensitive search
+        if not files_processed:
+            log_message(
+                f"Searching for alternative source files in {lang_folder}..."
+            )
+            for filename in os.listdir(lang_folder):
+                lower_filename = filename.lower()
+
+                # Try to find JSON files with case-insensitive matching
+                if lower_filename == f"{self.source_mc_lang.lower()}{JSON}".lower():
+                    source_file_path = os.path.join(lang_folder, filename)
+                    target_file_path = os.path.join(
+                        lang_folder, f"{self.target_mc_lang.lower()}{JSON}"
+                    )
+
+                    log_subtitle(
+                        f"Creating {self.target_mc_lang.lower()}{JSON} from {filename}..."
+                    )
+                    original_data = self._read_json_file(source_file_path)
+                    if original_data:
+                        # Check if target file already exists (resume optimization)
+                        translated_data = {}
+                        if os.path.exists(target_file_path):
+                            existing_data = self._read_json_file(target_file_path)
+                            if existing_data:
+                                translated_data = existing_data.copy()
+                                keys_to_translate = {k: v for k, v in original_data.items() 
+                                                   if k not in translated_data or not translated_data[k]}
+                                if keys_to_translate:
+                                    log_message(f"Resuming: {len(keys_to_translate)} new/modified entries to translate")
+                                    new_translations = self.translator.translate_data(keys_to_translate)
+                                    translated_data.update(new_translations)
+                                else:
+                                    log_message(f"Skipping: All entries already translated")
+                            else:
+                                translated_data = self.translator.translate_data(original_data)
+                        else:
+                            translated_data = self.translator.translate_data(original_data)
+                        
+                        self._write_json_file(translated_data, target_file_path)
+                        log_message(
+                            f"Successfully translated JSON file for {mod_name}"
+                        )
+                        files_processed = True
+                    else:
+                        log_message(
+                            f"No data found in source JSON file for {mod_name}"
+                        )
+
+                # Try to find LANG files with case-insensitive matching
+                elif lower_filename == f"{self.source_mc_lang}{LANG}".lower():
+                    source_file_path = os.path.join(lang_folder, filename)
+                    target_file_path = os.path.join(
+                        lang_folder, f"{self.target_mc_lang}{LANG}"
+                    )
+
+                    log_subtitle(
+                        f"Creating {self.target_mc_lang}{LANG} from {filename}..."
+                    )
+                    original_data = self._read_lang_file(source_file_path)
+                    if original_data:
+                        # Check if target file already exists (resume optimization)
+                        translated_data = {}
+                        if os.path.exists(target_file_path):
+                            existing_data = self._read_lang_file(target_file_path)
+                            if existing_data:
+                                translated_data = existing_data.copy()
+                                keys_to_translate = {k: v for k, v in original_data.items() 
+                                                   if k not in translated_data or not translated_data[k]}
+                                if keys_to_translate:
+                                    log_message(f"Resuming: {len(keys_to_translate)} new/modified entries to translate")
+                                    new_translations = self.translator.translate_data(keys_to_translate)
+                                    translated_data.update(new_translations)
+                                else:
+                                    log_message(f"Skipping: All entries already translated")
+                            else:
+                                translated_data = self.translator.translate_data(original_data)
+                        else:
+                            translated_data = self.translator.translate_data(original_data)
+                        
+                        self._write_lang_file(translated_data, target_file_path)
+                        log_message(
+                            f"Successfully translated LANG file for {mod_name}"
+                        )
+                        files_processed = True
+                    else:
+                        log_message(
+                            f"No data found in source LANG file for {mod_name}"
+                        )
+
+        if not files_processed:
+            log_message(f"No translatable language files found for {mod_name}")
+
+        # Check if this is a mod root folder and process .mcfunction files
+        # A mod root folder is directly under temp_path
+        temp_path_parts = self.temp_path.split(os.sep)
+        lang_folder_parts = lang_folder.split(os.sep)
+        
+        # Check if this folder is a mod root (temp_path + one level)
+        if len(lang_folder_parts) == len(temp_path_parts) + 1:
+            log_subtitle(f"Checking for .mcfunction files in {mod_name}...")
+            self.translate_mcfunction_files(lang_folder)
+            files_processed = True
 
     # Removed _translate_mod function as it's no longer needed
 
@@ -891,7 +1143,7 @@ class FileManager:
 
     def translate_mcfunction_files(self, mod_root_path: str) -> None:
         """
-        Find and translate all .mcfunction files in a mod.
+        Find and translate all .mcfunction files in a mod using threading with progress tracking.
         """
         mcfunction_files = []
         
@@ -907,43 +1159,109 @@ class FileManager:
             
         log_message(f"Found {len(mcfunction_files)} .mcfunction files to translate")
         
-        # Process each mcfunction file
-        for file_path in mcfunction_files:
-            log_message(f"Processing {file_path}")
-            
-            # Read translatable text from the file
-            original_data = self._read_mcfunction_file(file_path)
-            
-            if original_data:
-                # Translate the extracted text
-                translated_data = self.translator.translate_data(original_data)
+        # Use threading for mcfunction file processing
+        max_workers = min(3, max(1, len(mcfunction_files) // 2))
+        
+        # Create progress tracker
+        progress = ThreadSafeProgress()
+        progress.start("Processing MCFunction files")
+        task_id = progress.add_task("MCFunction", total=len(mcfunction_files))
+        
+        try:
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = {}
                 
-                # Write back the translated content
-                self._write_mcfunction_file(file_path, translated_data)
+                for file_path in mcfunction_files:
+                    future = executor.submit(self._translate_single_mcfunction, file_path)
+                    futures[future] = file_path
                 
-                log_message(f"Successfully translated {len(original_data)} strings in {file_path}")
-            else:
-                log_message(f"No translatable content found in {file_path}")
+                # Process results as they complete
+                for future in as_completed(futures):
+                    try:
+                        future.result()
+                    except Exception as e:
+                        file_path = futures[future]
+                        log_message(f"Error translating {file_path}: {str(e)}")
+                    finally:
+                        progress.update(task_id, advance=1)
+        finally:
+            progress.stop()
+
+    def _translate_single_mcfunction(self, file_path: str) -> None:
+        """
+        Translate a single mcfunction file (used for threading).
+        """
+        log_message(f"Processing {file_path}")
+        
+        # Read translatable text from the file
+        original_data = self._read_mcfunction_file(file_path)
+        
+        if original_data:
+            # Translate the extracted text
+            translated_data = self.translator.translate_data(original_data)
+            
+            # Write back the translated content
+            self._write_mcfunction_file(file_path, translated_data)
+            
+            log_message(f"Successfully translated {len(original_data)} strings in {file_path}")
+        else:
+            log_message(f"No translatable content found in {file_path}")
 
     def convert_translated_mods(self) -> None:
         """
-        Convert all translated mod folders into JAR files.
+        Convert all translated mod folders into JAR files using threading with progress tracking.
         """
         mod_folder_list = os.listdir(self.temp_path)
-        for mod_folder in mod_folder_list:
-            log_message(f'Converting {mod_folder} into mod file...')
-            unpacked_mod_path = os.path.join(self.temp_path, mod_folder)
-            
-            # Check if input and output paths are the same
-            same_paths = os.path.abspath(self.mods_path) == os.path.abspath(self.translation_path)
-            
-            # If same paths, create JAR directly in mods_path to avoid file access issues
-            if same_paths:
-                translation_path = os.path.join(self.mods_path, mod_folder)
-            else:
-                translation_path = os.path.join(self.translation_path, mod_folder)
+        
+        if not mod_folder_list:
+            log_message("No mod folders found to convert")
+            return
+        
+        # Use threading for JAR file creation
+        max_workers = min(3, max(1, len(mod_folder_list) // 2))
+        
+        # Create progress tracker
+        progress = ThreadSafeProgress()
+        progress.start("Creating JAR files")
+        task_id = progress.add_task("JAR Creation", total=len(mod_folder_list))
+        
+        try:
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = {}
                 
-            self._convert_folder_to_jar(unpacked_mod_path, translation_path)
+                for mod_folder in mod_folder_list:
+                    future = executor.submit(self._convert_single_mod, mod_folder)
+                    futures[future] = mod_folder
+                
+                # Process results as they complete
+                for future in as_completed(futures):
+                    try:
+                        future.result()
+                    except Exception as e:
+                        mod_folder = futures[future]
+                        log_message(f"Error converting {mod_folder}: {str(e)}")
+                    finally:
+                        progress.update(task_id, advance=1)
+        finally:
+            progress.stop()
+
+    def _convert_single_mod(self, mod_folder: str) -> None:
+        """
+        Convert a single mod folder to JAR (used for threading).
+        """
+        log_message(f'Converting {mod_folder} into mod file...')
+        unpacked_mod_path = os.path.join(self.temp_path, mod_folder)
+
+        # Check if input and output paths are the same
+        same_paths = os.path.abspath(self.mods_path) == os.path.abspath(self.translation_path)
+
+        # If same paths, create JAR directly in mods_path to avoid file access issues
+        if same_paths:
+            translation_path = os.path.join(self.mods_path, mod_folder)
+        else:
+            translation_path = os.path.join(self.translation_path, mod_folder)
+
+        self._convert_folder_to_jar(unpacked_mod_path, translation_path)
 
     def _convert_folder_to_jar(self, folder_path: str, jar_path: str) -> None:
         """
