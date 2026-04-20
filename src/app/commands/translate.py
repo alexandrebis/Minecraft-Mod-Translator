@@ -7,6 +7,7 @@ import json
 import re
 import shutil
 import argparse
+import time
 from zipfile import ZipFile, ZIP_DEFLATED
 from typing import Dict, List, Any, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -271,7 +272,6 @@ class Translator:
 
     def _translate_data_openai(self, data: Dict[str, str]) -> Dict[str, str]:
         """Translate data using OpenAI with rate limiting protection, threading, and progress tracking"""
-        import time
         
         translated_data = {}
         total_items = len(data)
@@ -324,15 +324,15 @@ class Translator:
         return translated_data
 
     def _translate_data_google(self, data: Dict[str, str]) -> Dict[str, str]:
-        """Translate data using Google Translate with rate limiting protection, threading, and progress tracking"""
-        import time
+        """Translate data using Google Translate with strict rate limiting (5 req/sec), threading, and progress tracking"""
         
         translated_data = {}
         total_items = len(data)
         
-        # Use threading for faster translation
-        # Limit concurrent threads to avoid overwhelming the API
-        max_workers = min(4, max(1, total_items // 10))  # Adaptive threading
+        # Google Translate: 5 requests per second max = 200ms per request
+        # Use VERY conservative threading to respect rate limits
+        # With 200ms per request, even 1 worker is optimal
+        max_workers = 1
         
         # Create progress tracker
         progress = ThreadSafeProgress()
@@ -341,8 +341,22 @@ class Translator:
         
         try:
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                # Create list of futures
                 future_to_key = {}
+                last_request_time = [0]  # Use list to allow modification in nested function
+                request_lock = Lock()
+                
+                def translate_with_rate_limit(text):
+                    """Translate with rate limiting: 5 requests per second (200ms minimum between requests)."""
+                    with request_lock:
+                        # Ensure 200ms minimum between requests
+                        elapsed = time.time() - last_request_time[0]
+                        min_delay = 0.2  # 5 requests per second
+                        if elapsed < min_delay:
+                            time.sleep(min_delay - elapsed)
+                        last_request_time[0] = time.time()
+                    
+                    # Now make the actual translation request
+                    return self._translate_with_google(text)
                 
                 for index, (key, text) in enumerate(data.items(), 1):
                     if not text or not isinstance(text, str):
@@ -352,11 +366,10 @@ class Translator:
                         continue
                     
                     # Submit translation task to thread pool
-                    future = executor.submit(self._translate_with_google, text)
+                    future = executor.submit(translate_with_rate_limit, text)
                     future_to_key[future] = (key, text, index)
                 
                 # Process completed translations as they finish
-                completed = 0
                 for future in as_completed(future_to_key):
                     key, original_text, index = future_to_key[future]
                     try:
@@ -368,15 +381,10 @@ class Translator:
                         translated_data[key] = original_text  # Keep original on error
                     finally:
                         progress.update(task_id, advance=1)
-                    
-                    completed += 1
-                    # Add small delay between batches to avoid rate limiting
-                    if completed % 5 == 0 and completed < total_items:
-                        time.sleep(0.2)
         finally:
             progress.stop()
         
-        log_message(f"Successfully translated {len(translated_data)} entries using Google Translate")
+        log_message(f"Successfully translated {len(translated_data)} entries using Google Translate (rate limited: 5 req/sec)")
         return translated_data
 
     def translate(self, string: str) -> str:
@@ -1367,6 +1375,101 @@ class FileManager:
         except Exception as e:
             log_message(f"ERROR creating JAR file: {str(e)}")
 
+    def process_single_jar(self, jar_file: str) -> bool:
+        """
+        Process a single JAR file: extract, translate, and generate output.
+        Returns True if successful, False if skipped or failed.
+        """
+        jar_path = os.path.join(self.mods_path, jar_file)
+        jar_name = jar_file.replace(JAR, "")
+        
+        # Check if output already exists (resume optimization)
+        same_paths = os.path.abspath(self.mods_path) == os.path.abspath(self.translation_path)
+        if same_paths:
+            output_jar_path = os.path.join(self.mods_path, jar_file)
+        else:
+            output_jar_path = os.path.join(self.translation_path, jar_file)
+        
+        # Skip if already translated
+        if os.path.exists(output_jar_path):
+            return (True, jar_file, "already_translated")
+        
+        temp_mod_path = os.path.join(self.temp_path, jar_file)
+        
+        try:
+            # Extract this JAR only
+            # (Logs disabled during progress bar)
+            with ZipFile(jar_path, "r") as zip:
+                zip.extractall(temp_mod_path)
+            
+            # Find language folders in this JAR
+            lang_folders = self._get_lang_folders_for_mod(temp_mod_path, jar_file)
+            
+            if lang_folders:
+                # Translate language files
+                # (Logs disabled during progress bar)
+                self._process_lang_folder(temp_mod_path)
+                
+                # Generate output JAR
+                self._convert_folder_to_jar(temp_mod_path, output_jar_path)
+                
+                return (True, jar_file, "processed")
+            else:
+                return (True, jar_file, "no_language_files")
+                
+        except Exception as e:
+            # (Error logging will be handled after progress bar stops)
+            return (False, jar_file, "error")
+        finally:
+            # Clean up temp folder for this JAR
+            if os.path.exists(temp_mod_path):
+                try:
+                    shutil.rmtree(temp_mod_path)
+                except:
+                    pass
+
+    def _get_lang_folders_for_mod(self, mod_path: str, jar_name: str) -> List[str]:
+        """
+        Get language folders for a specific mod.
+        """
+        lang_folders = []
+        found_files = []
+        
+        # Find language files in this mod
+        for foldername, _, filenames in os.walk(mod_path):
+            for filename in filenames:
+                lower_filename = filename.lower()
+                if (lower_filename == f"{self.source_mc_lang.lower()}{JSON}".lower() or
+                    lower_filename == f"{self.source_mc_lang}{JSON}".lower() or
+                    lower_filename == f"{self.source_mc_lang.lower()}{LANG}".lower() or
+                    lower_filename == f"{self.source_mc_lang}{LANG}".lower()):
+                    found_files.append((foldername, filename))
+        
+        # Get language folders
+        for folder, filename in found_files:
+            if "lang" in folder.lower():
+                if folder not in lang_folders:
+                    lang_folders.append(folder)
+            else:
+                parent_folder = os.path.dirname(folder)
+                if parent_folder not in lang_folders:
+                    lang_folders.append(parent_folder)
+        
+        # Add mcfunction root if exists
+        mcfunction_exists = False
+        for foldername, _, filenames in os.walk(mod_path):
+            for filename in filenames:
+                if filename.endswith(MCFUNCTION):
+                    mcfunction_exists = True
+                    break
+            if mcfunction_exists:
+                break
+        
+        if mcfunction_exists and mod_path not in lang_folders:
+            lang_folders.append(mod_path)
+        
+        return lang_folders
+
     def remove_original_mod_files(self) -> None:
         """
         Remove original JAR files from mods folder, but leave folders intact.
@@ -1619,90 +1722,93 @@ def handle_translate_command(args: argparse.Namespace) -> None:
         
         file_manager.create_needed_folders()
         
-        # Check if we should resume a previous translation
-        resume_translation = settings.resume
-
-        # If not explicitly set via CLI, check if an incomplete translation exists
-        incomplete_info = None
-        if not resume_translation:
-            incomplete_info = file_manager.check_incomplete_translation()
-            if incomplete_info:
-                log_message(f"Found incomplete translation for {settings.target_mc_lang}")
-                log_message(f"  • {len(incomplete_info['target_files'])} translated file(s) detected")
-                log_message(f"  • {len(incomplete_info['source_files'])} source file(s) available for completion")
-                log_message(f"  • Data size: {incomplete_info['temp_size'] / (1024*1024):.2f} MB")
-                log_message("")
-                log_message("Would you like to resume this translation? (y/n)")
-                response = input().strip().lower()
-                resume_translation = response in ['y', 'yes']
-
-        # Handle unpacking based on resume status
-        if resume_translation:
-            incomplete_info = incomplete_info or file_manager.check_incomplete_translation()
-            if incomplete_info:
-                log_title('Resuming previous translation...')
-                log_message(f"Using existing unpacked mods in {file_manager.temp_path}")
-                log_message(f"Continuing translation to {settings.target_mc_lang}...")
-                # Skip unpacking, files should already be extracted
-            else:
-                log_message(f"⚠️ No incomplete translation found for {settings.target_mc_lang}")
-                log_message("Starting fresh translation...")
-                log_title('Unpacking mod files...')
-                file_manager.unpack_mods()
-        else:
-            # Check if temp folder exists and needs to be cleaned
-            if os.path.exists(file_manager.temp_path) and os.listdir(file_manager.temp_path):
-                log_message(f"Cleaning existing temp folder at {file_manager.temp_path}")
-                file_manager.remove_folder(file_manager.temp_path)
-                file_manager.create_needed_folders()
-
-            log_title('Unpacking mod files...')
-            file_manager.unpack_mods()
-
-        lang_folders = file_manager.get_lang_folders()
-        log_title('Translating mods...')
-        file_manager.edit_lang_files(lang_folders)
         
-        # If input and output paths are the same, we need to handle this case specially
-        same_paths = os.path.abspath(settings.mods_path) == os.path.abspath(settings.translation_path)
+        # Get list of JAR files
+        mod_list = os.listdir(settings.mods_path)
+        jar_files = [m for m in mod_list if m.endswith(JAR)]
         
-        if same_paths:
-            log_title('Input and output paths are the same - removing original JAR files first...')
-            # Step 1: Get list of all original JAR files to be replaced
-            original_jars = [f for f in os.listdir(settings.mods_path) if f.endswith(JAR)]
-            log_message(f"Found {len(original_jars)} original JAR files that will be replaced")
+        if not jar_files:
+            log_message("No JAR files found to translate")
+            return
+        
+        log_message(f"Found {len(jar_files)} mod(s) to process\n")
+        
+        # Disable logging while progress bar is active to avoid overlap
+        global DISABLE_LOGS
+        original_disable = DISABLE_LOGS
+        DISABLE_LOGS = True
+        
+        # Use a clean console before showing the progress bar
+        print()
+        
+        progress = ThreadSafeProgress()
+        progress.start("Processing mods")
+        task_id = progress.add_task("Mods", total=len(jar_files))
+        
+        try:
+            processed = 0
+            skipped = 0
+            failed = 0
+            skip_messages = []
             
-            # Step 2: Remove original JAR files BEFORE generating new ones (no backup)
-            for jar_file in original_jars:
-                jar_path = os.path.join(settings.mods_path, jar_file)
-                try:
-                    os.remove(jar_path)
-                    log_message(f"Removed original JAR: {jar_path}")
-                except Exception as e:
-                    log_message(f"Error removing {jar_path}: {e}")
-        
-        # Now convert to mod files - the convert_translated_mods method now handles same paths
-        log_title('Converting to mod files...')
-        file_manager.convert_translated_mods()
-        
-        # If same paths, no need to copy files since they're already created in the right place
-        if same_paths:
-            log_title('Verifying translated JAR files...')
-            jar_files = [f for f in os.listdir(settings.mods_path) if f.endswith(JAR)]
-            log_message(f"Found {len(jar_files)} JAR files in output directory")
-            
-            # Verify the files exist and have size
             for jar_file in jar_files:
-                jar_path = os.path.join(settings.mods_path, jar_file)
-                size = os.path.getsize(jar_path)
-                log_message(f"Verified JAR file: {jar_file} ({size} bytes)")
-        else:
-            # Different paths - output is already in the translation_path
-            log_title('Translation completed to output directory...')
+                try:
+                    result = file_manager.process_single_jar(jar_file)
+                    if isinstance(result, tuple):
+                        success, mod_name, status = result
+                        if success:
+                            if status == "processed":
+                                processed += 1
+                            elif status == "already_translated":
+                                skipped += 1
+                                skip_messages.append(f"⏭️ Skipping {mod_name} (already translated)")
+                            elif status == "no_language_files":
+                                skipped += 1
+                                skip_messages.append(f"⏭️ No language files found in {mod_name}")
+                        else:
+                            failed += 1
+                    else:
+                        # Backward compatibility: if it returns a boolean
+                        if result:
+                            processed += 1
+                        else:
+                            failed += 1
+                except Exception as e:
+                    progress.stop()
+                    DISABLE_LOGS = original_disable
+                    log_message(f"❌ Failed to process {jar_file}: {str(e)}")
+                    progress.start("Processing mods")
+                    DISABLE_LOGS = True
+                    failed += 1
+                finally:
+                    progress.update(task_id, advance=1)
+        finally:
+            progress.stop()
+            DISABLE_LOGS = original_disable
+            print()  # Add blank line to prevent overlap with progress bar
         
-        # Clean up
-        file_manager.remove_folder(settings.temp_path)
-        log_title('All mods have been translated!\n')
+        # Display skip messages after progress bar stops
+        for msg in skip_messages:
+            log_message(msg)
+        
+        # Summary
+        log_title('Translation Complete!')
+        log_message(f"✅ Processed: {processed} mod(s)")
+        log_message(f"⏭️ Skipped: {skipped} mod(s) (already translated)")
+        if failed > 0:
+            log_message(f"❌ Failed: {failed} mod(s)")
+        
+        # Clean up temp folder
+        if os.path.exists(settings.temp_path):
+            shutil.rmtree(settings.temp_path)
+        
+        # Only show success message if at least one mod was processed
+        if processed > 0:
+            log_title('All mods have been translated!\n')
+        elif skipped > 0:
+            log_title('All mods were already translated!\n')
+        else:
+            log_title('Translation process complete!\n')
     except Exception as e:
         print(f"Error translating mods: {e}")
         import traceback
